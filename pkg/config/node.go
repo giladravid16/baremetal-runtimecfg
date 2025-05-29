@@ -29,6 +29,12 @@ const (
 	localhostKubeApiServerUrl string = "https://localhost:6443"
 	// labelNodeRolePrefix is a label prefix for node roles
 	labelNodeRolePrefix = "node-role.kubernetes.io/"
+	// controlPlaneTopologyPath is the path to a file whose content is the cluster's control plane topology
+	controlPlaneTopologyPath string = "/host/etc/kubernetes/control-plane-topology"
+	// highlyAvailableArbiterMode is the control plane topology when installing TNA
+	highlyAvailableArbiterMode string = "HighlyAvailableArbiter"
+	// dualReplicaTopologyMode is the control plane topology when installing TNF
+	dualReplicaTopologyMode string = "DualReplica"
 )
 
 type NodeAddress struct {
@@ -691,22 +697,6 @@ func getSortedBackends(kubeconfigPath string, readFromLocalAPI bool, vips []net.
 		}).Info("Failed to get master Nodes list")
 		return []Backend{}, err
 	}
-	// When installing TNA clusters using assisted service, one of the master nodes acts as the bootstrap.
-	// So during the installation there will only be one master node, but we need two in order to configure keepalived.
-	// We cannot wait until the bootstrap finishes and becomes a master, because then no node will have the API vip.
-	// To circumvent that we will add the arbiter node to the list of nodes.
-	if len(nodes.Items) == 1 {
-		arbiters, err := clientset.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{
-			LabelSelector: "node-role.kubernetes.io/arbiter=",
-		})
-		if err != nil {
-			log.WithFields(logrus.Fields{
-				"err": err,
-			}).Info("Failed to get arbiter Nodes list")
-			return []Backend{}, err
-		}
-		nodes.Items = append(nodes.Items, arbiters.Items...)
-	}
 	if len(vips) == 0 {
 		return []Backend{}, fmt.Errorf("Trying to build config using empty VIPs")
 	}
@@ -751,6 +741,24 @@ func getSortedBackends(kubeconfigPath string, readFromLocalAPI bool, vips []net.
 					"err": err,
 				}).Warnf("Could not retrieve node's IP for %s. Ignoring", node.ObjectMeta.Name)
 			}
+		}
+	}
+
+	// When installing TNA/TNF clusters using assisted service, one of the master nodes acts as the bootstrap.
+	// So during the installation there will only be one master node, but we need two in order to configure keepalived.
+	// We cannot wait until the bootstrap finishes and becomes a master, because then no node will have the API vip.
+	// To circumvent that we will temporarily add a dummy ip to the list of nodes.
+	// After the bootstrap becomes a master node, it's ip will replace the dummy ip in the list.
+	content, err := os.ReadFile(controlPlaneTopologyPath)
+	if err != nil {
+		log.WithFields(logrus.Fields{
+			"err": err,
+		}).Warn("Could not read control plane topology file. Ignoring")
+	} else {
+		topology := string(content)
+		if len(nodes.Items) == 1 &&
+			(topology == highlyAvailableArbiterMode || topology == dualReplicaTopologyMode) {
+			backends = append(backends, Backend{Host: "dummy", Address: "0.0.0.0"})
 		}
 	}
 
